@@ -49,6 +49,12 @@ case "$INPUT_BANACTION" in
     *) BANACTION="iptables-multiport" ;;
 esac
 
+# fix: 只有 iptables 系列才有 -allports 变体
+case "$BANACTION" in
+    iptables-multiport) BANACTION_ALLPORTS="iptables-allports" ;;
+    *)                  BANACTION_ALLPORTS="$BANACTION" ;;
+esac
+
 echo "6. 触发封禁后的附带动作:"
 echo "   [1] action_    : 仅静默封禁 IP (默认)"
 echo "   [2] action_mw  : 封禁 IP 并发送邮件通知"
@@ -61,7 +67,9 @@ case "$INPUT_ACTION" in
 esac
 
 DESTEMAIL="root@localhost"
-SENDER="fail2ban@$(hostname)"
+# fix: 使用 hostname -f 获取 FQDN，避免短主机名导致非法邮件地址
+FQDN=$(hostname -f 2>/dev/null || hostname)
+SENDER="fail2ban@${FQDN}"
 if [[ "$ACTION" != "action_" ]]; then
     read -p "   -> 请输入接收报警的邮箱地址: " INPUT_EMAIL
     DESTEMAIL=${INPUT_EMAIL:-"root@localhost"}
@@ -90,7 +98,7 @@ get_pkg_manager() {
     if check_cmd apt-get;  then echo "apt"
     elif check_cmd dnf;    then echo "dnf"
     elif check_cmd yum;    then echo "yum"
-    elif check_cmd zypper; then echo "zypper"  # 新增 SUSE 支持
+    elif check_cmd zypper; then echo "zypper"
     elif check_cmd pacman; then echo "pacman"
     elif check_cmd apk;    then echo "apk"
     else echo "unknown"
@@ -99,28 +107,40 @@ get_pkg_manager() {
 
 PKG_MGR=$(get_pkg_manager)
 
-# 动态决定是否安装 whois（避免由于找不到 whois 导致 fail2ban 也装不上）
-EXTRA_PKGS=""
-[[ "$ACTION" == "action_mwl" ]] && EXTRA_PKGS="whois"
+# fix: 用数组管理包列表，避免空变量展开问题
+PKGS=(fail2ban)
+if [[ "$ACTION" == "action_mwl" ]]; then
+    PKGS+=(whois)
+fi
+# fix: 邮件动作需要 MTA，检测并补充安装
+if [[ "$ACTION" != "action_" ]]; then
+    if ! check_cmd sendmail && ! check_cmd msmtp; then
+        case "$PKG_MGR" in
+            apt)           PKGS+=(mailutils) ;;
+            dnf|yum)       PKGS+=(mailx) ;;
+            zypper|pacman) PKGS+=(mailutils) ;;
+        esac
+    fi
+fi
 
 case "$PKG_MGR" in
     apt)
-        apt-get update -qq -y
-        apt-get install -y fail2ban $EXTRA_PKGS
+        apt-get update -qq
+        apt-get install -y "${PKGS[@]}"
         ;;
     dnf|yum)
-        $PKG_MGR install -y epel-release 2>/dev/null || true # 容错处理
-        $PKG_MGR install -y fail2ban $EXTRA_PKGS
+        $PKG_MGR install -y epel-release 2>/dev/null || true
+        $PKG_MGR install -y "${PKGS[@]}"
         ;;
     zypper)
-        zypper install -y fail2ban $EXTRA_PKGS
+        zypper install -y "${PKGS[@]}"
         ;;
     pacman)
-        pacman -Sy --noconfirm fail2ban $EXTRA_PKGS
+        pacman -Sy --noconfirm "${PKGS[@]}"
         ;;
     apk)
         apk update
-        apk add fail2ban $EXTRA_PKGS
+        apk add "${PKGS[@]}"
         ;;
     *)
         echo -e "${RED}错误：无法识别的包管理器，请手动安装 Fail2ban。${NC}"
@@ -129,7 +149,31 @@ case "$PKG_MGR" in
 esac
 
 # -------------------------------------------------------------
-# 3. 生成动态配置文件
+# 3. 检测 fail2ban 版本，旧版本不支持时间字符串，转换为秒数
+# -------------------------------------------------------------
+F2B_VER=$(fail2ban-server --version 2>/dev/null | grep -oP '\d+\.\d+' | head -1)
+F2B_MAJOR=$(echo "$F2B_VER" | cut -d. -f1)
+F2B_MINOR=$(echo "$F2B_VER" | cut -d. -f2)
+
+to_seconds() {
+    local val="$1"
+    if [[ "$val" =~ ^([0-9]+)d$ ]]; then echo $(( ${BASH_REMATCH[1]} * 86400 ))
+    elif [[ "$val" =~ ^([0-9]+)h$ ]]; then echo $(( ${BASH_REMATCH[1]} * 3600 ))
+    elif [[ "$val" =~ ^([0-9]+)m$ ]]; then echo $(( ${BASH_REMATCH[1]} * 60 ))
+    elif [[ "$val" =~ ^([0-9]+)s?$ ]]; then echo "${BASH_REMATCH[1]}"
+    else echo "$val"  # 无法识别则原样返回
+    fi
+}
+
+# fix: fail2ban < 0.10 不支持时间字符串，转换为秒
+if [[ -n "$F2B_MAJOR" ]] && { [[ "$F2B_MAJOR" -lt 0 ]] || { [[ "$F2B_MAJOR" -eq 0 ]] && [[ "$F2B_MINOR" -lt 10 ]]; }; }; then
+    echo -e "${YELLOW}[!] 检测到旧版 fail2ban ($F2B_VER)，时间参数将自动转换为秒数。${NC}"
+    BANTIME=$(to_seconds "$BANTIME")
+    FINDTIME=$(to_seconds "$FINDTIME")
+fi
+
+# -------------------------------------------------------------
+# 4. 生成动态配置文件
 # -------------------------------------------------------------
 echo -e "${GREEN}[*] 正在生成 Fail2ban 配置文件...${NC}"
 mkdir -p /etc/fail2ban
@@ -142,7 +186,7 @@ findtime  = $FINDTIME
 maxretry = $MAXRETRY
 backend = $BACKEND
 banaction = $BANACTION
-banaction_allports = ${BANACTION}-allports
+banaction_allports = $BANACTION_ALLPORTS
 destemail = $DESTEMAIL
 sender = $SENDER
 mta = sendmail
@@ -156,23 +200,21 @@ backend = %(sshd_backend)s
 EOF
 
 # -------------------------------------------------------------
-# 4. 极致兼容的服务自启与管理
+# 5. 极致兼容的服务自启与管理
 # -------------------------------------------------------------
 echo -e "${GREEN}[*] 正在重启服务使其生效...${NC}"
 
-if check_cmd systemctl && systemctl list-units &>/dev/null 2>&1; then
-    # 现代 Linux (Systemd)
+# fix: 修正冗余重定向写法
+if check_cmd systemctl && systemctl list-units &>/dev/null; then
     systemctl daemon-reload
     systemctl enable fail2ban
     systemctl restart fail2ban
     echo -e "${GREEN}[√] Fail2ban (systemd) 启动指令已执行！${NC}"
 elif check_cmd rc-service; then
-    # Alpine / Gentoo (OpenRC)
     rc-update add fail2ban default
     rc-service fail2ban restart
     echo -e "${GREEN}[√] Fail2ban (openrc) 启动指令已执行！${NC}"
 elif [[ -x /etc/init.d/fail2ban ]]; then
-    # 老旧 Linux (SysVinit) - 新增支持
     if check_cmd update-rc.d; then
         update-rc.d fail2ban defaults
     elif check_cmd chkconfig; then
@@ -182,6 +224,14 @@ elif [[ -x /etc/init.d/fail2ban ]]; then
     echo -e "${GREEN}[√] Fail2ban (sysvinit) 启动指令已执行！${NC}"
 else
     echo -e "${YELLOW}警告：无法自动管理服务，请手动启动 fail2ban (如：fail2ban-server -b)。${NC}"
+fi
+
+# fix: 验证服务是否真正启动成功
+sleep 2
+if fail2ban-client status &>/dev/null; then
+    echo -e "${GREEN}[√] Fail2ban 服务运行正常。${NC}"
+else
+    echo -e "${RED}[!] 警告：fail2ban 可能未正常运行，请检查日志：journalctl -xe -u fail2ban${NC}"
 fi
 
 echo -e "\n${CYAN}=================================================${NC}"
