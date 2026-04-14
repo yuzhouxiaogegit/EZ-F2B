@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # =============================================================
-# Fail2ban 全参数交互式安装与配置脚本 (极致兼容版)
+# Fail2ban 全参数交互式安装与配置脚本 (极致兼容优化版)
 # =============================================================
 
 NC='\033[0m'
@@ -18,7 +18,7 @@ fi
 
 clear
 echo -e "${CYAN}=================================================${NC}"
-echo -e "${CYAN}${BOLD}       Fail2ban 全参数交互式高级配置脚本       ${NC}"
+echo -e "${CYAN}${BOLD}       Fail2ban 全参数交互式高级配置脚本        ${NC}"
 echo -e "${CYAN}=================================================${NC}\n"
 
 # -------------------------------------------------------------
@@ -28,14 +28,14 @@ echo -e "${YELLOW}--- 基础防御参数 ---${NC}"
 read -p "1. 白名单 IP (多个用空格隔开。直接回车默认: 127.0.0.1/8 ::1): " INPUT_IGNOREIP
 IGNOREIP=${INPUT_IGNOREIP:-"127.0.0.1/8 ::1"}
 
-read -p "2. 封禁时长 (如 10m, 1h, 1d。直接回车默认: 1h): " INPUT_BANTIME
-BANTIME=${INPUT_BANTIME:-"1h"}
+read -p "2. 封禁时长 (如 10m, 1h, 1d。直接回车默认: 24h): " INPUT_BANTIME
+BANTIME=${INPUT_BANTIME:-"24h"}
 
 read -p "3. 统计时间窗口 (直接回车默认: 10m): " INPUT_FINDTIME
 FINDTIME=${INPUT_FINDTIME:-"10m"}
 
-read -p "4. 最大密码错误次数 (直接回车默认: 5): " INPUT_MAXRETRY
-MAXRETRY=${INPUT_MAXRETRY:-"5"}
+read -p "4. 最大密码错误次数 (直接回车默认: 3): " INPUT_MAXRETRY
+MAXRETRY=${INPUT_MAXRETRY:-"3"}
 
 echo -e "\n${YELLOW}--- 高级控制参数 ---${NC}"
 echo "5. 防火墙动作:"
@@ -49,7 +49,6 @@ case "$INPUT_BANACTION" in
     *) BANACTION="iptables-multiport" ;;
 esac
 
-# fix: 只有 iptables 系列才有 -allports 变体
 case "$BANACTION" in
     iptables-multiport) BANACTION_ALLPORTS="iptables-allports" ;;
     *)                  BANACTION_ALLPORTS="$BANACTION" ;;
@@ -67,17 +66,16 @@ case "$INPUT_ACTION" in
 esac
 
 DESTEMAIL="root@localhost"
-# fix: 使用 hostname -f 获取 FQDN，避免短主机名导致非法邮件地址
 FQDN=$(hostname -f 2>/dev/null || hostname)
 SENDER="fail2ban@${FQDN}"
 if [[ "$ACTION" != "action_" ]]; then
-    read -p "   -> 请输入接收报警的邮箱地址: " INPUT_EMAIL
+    read -p "    -> 请输入接收报警的邮箱地址: " INPUT_EMAIL
     DESTEMAIL=${INPUT_EMAIL:-"root@localhost"}
 fi
 
 echo "7. 日志监控引擎 (backend):"
-echo "   [1] auto    : 自动选择 (默认，推荐)"
-echo "   [2] systemd : 读取 systemd journal"
+echo "   [1] auto    : 自动选择 (默认，推荐脚本自动判定)"
+echo "   [2] systemd : 强制读取 systemd journal (推荐新版系统)"
 echo "   [3] polling : 传统轮询读取文件"
 read -p "请输入序号 [1-3] (直接回车默认 1): " INPUT_BACKEND
 case "$INPUT_BACKEND" in
@@ -86,97 +84,57 @@ case "$INPUT_BACKEND" in
     *) BACKEND="auto" ;;
 esac
 
+# -------------------------------------------------------------
+# 2. 智能逻辑优化：自动修复 backend
+# -------------------------------------------------------------
+# 如果用户选 auto，但系统不存在传统日志文件，强制切换为 systemd
+if [[ "$BACKEND" == "auto" ]]; then
+    if [[ ! -f /var/log/auth.log ]] && [[ ! -f /var/log/secure ]]; then
+        echo -e "${YELLOW}[!] 检测到系统不存在传统日志文件，自动切换 backend 为 systemd${NC}"
+        BACKEND="systemd"
+    fi
+fi
+
 echo -e "\n${GREEN}[*] 参数收集完毕，正在执行安装与配置...${NC}\n"
 sleep 1
 
 # -------------------------------------------------------------
-# 2. 极致兼容的包管理器检测与安装
+# 3. 包管理器检测与安装
 # -------------------------------------------------------------
 check_cmd() { command -v "$1" &>/dev/null; }
-
 get_pkg_manager() {
     if check_cmd apt-get;  then echo "apt"
     elif check_cmd dnf;    then echo "dnf"
     elif check_cmd yum;    then echo "yum"
-    elif check_cmd zypper; then echo "zypper"
-    elif check_cmd pacman; then echo "pacman"
-    elif check_cmd apk;    then echo "apk"
     else echo "unknown"
     fi
 }
 
 PKG_MGR=$(get_pkg_manager)
-
-# fix: 用数组管理包列表，避免空变量展开问题
 PKGS=(fail2ban)
-if [[ "$ACTION" == "action_mwl" ]]; then
-    PKGS+=(whois)
-fi
-# fix: 邮件动作需要 MTA，检测并补充安装
-if [[ "$ACTION" != "action_" ]]; then
-    if ! check_cmd sendmail && ! check_cmd msmtp; then
-        case "$PKG_MGR" in
-            apt)           PKGS+=(mailutils) ;;
-            dnf|yum)       PKGS+=(mailx) ;;
-            zypper|pacman) PKGS+=(mailutils) ;;
-        esac
-    fi
-fi
+[[ "$ACTION" == "action_mwl" ]] && PKGS+=(whois)
 
 case "$PKG_MGR" in
     apt)
-        apt-get update -qq
-        apt-get install -y "${PKGS[@]}"
+        apt-get update -qq && apt-get install -y "${PKGS[@]}"
         ;;
     dnf|yum)
         $PKG_MGR install -y epel-release 2>/dev/null || true
         $PKG_MGR install -y "${PKGS[@]}"
         ;;
-    zypper)
-        zypper install -y "${PKGS[@]}"
-        ;;
-    pacman)
-        pacman -Sy --noconfirm "${PKGS[@]}"
-        ;;
-    apk)
-        apk update
-        apk add "${PKGS[@]}"
-        ;;
     *)
-        echo -e "${RED}错误：无法识别的包管理器，请手动安装 Fail2ban。${NC}"
-        exit 1
-        ;;
+        echo -e "${RED}错误：不支持的包管理器。${NC}" ; exit 1 ;;
 esac
 
 # -------------------------------------------------------------
-# 3. 检测 fail2ban 版本，旧版本不支持时间字符串，转换为秒数
-# -------------------------------------------------------------
-F2B_VER=$(fail2ban-server --version 2>/dev/null | grep -oP '\d+\.\d+' | head -1)
-F2B_MAJOR=$(echo "$F2B_VER" | cut -d. -f1)
-F2B_MINOR=$(echo "$F2B_VER" | cut -d. -f2)
-
-to_seconds() {
-    local val="$1"
-    if [[ "$val" =~ ^([0-9]+)d$ ]]; then echo $(( ${BASH_REMATCH[1]} * 86400 ))
-    elif [[ "$val" =~ ^([0-9]+)h$ ]]; then echo $(( ${BASH_REMATCH[1]} * 3600 ))
-    elif [[ "$val" =~ ^([0-9]+)m$ ]]; then echo $(( ${BASH_REMATCH[1]} * 60 ))
-    elif [[ "$val" =~ ^([0-9]+)s?$ ]]; then echo "${BASH_REMATCH[1]}"
-    else echo "$val"  # 无法识别则原样返回
-    fi
-}
-
-# fix: fail2ban < 0.10 不支持时间字符串，转换为秒
-if [[ -n "$F2B_MAJOR" ]] && { [[ "$F2B_MAJOR" -lt 0 ]] || { [[ "$F2B_MAJOR" -eq 0 ]] && [[ "$F2B_MINOR" -lt 10 ]]; }; }; then
-    echo -e "${YELLOW}[!] 检测到旧版 fail2ban ($F2B_VER)，时间参数将自动转换为秒数。${NC}"
-    BANTIME=$(to_seconds "$BANTIME")
-    FINDTIME=$(to_seconds "$FINDTIME")
-fi
-
-# -------------------------------------------------------------
-# 4. 生成动态配置文件
+# 4. 生成动态配置文件 (优化版)
 # -------------------------------------------------------------
 echo -e "${GREEN}[*] 正在生成 Fail2ban 配置文件...${NC}"
-mkdir -p /etc/fail2ban
+mkdir -p /etc/fail2ban/jail.d
+
+# 预判 logpath 逻辑
+LOG_LINE="logpath = %(sshd_log)s"
+[[ "$BACKEND" == "systemd" ]] && LOG_LINE="# logpath = (systemd mode does not need this)"
 
 cat > /etc/fail2ban/jail.local << EOF
 [DEFAULT]
@@ -195,46 +153,38 @@ action = %($ACTION)s
 [sshd]
 enabled = true
 port    = ssh
-logpath = %(sshd_log)s
-backend = %(sshd_backend)s
+$LOG_LINE
 EOF
 
 # -------------------------------------------------------------
-# 5. 极致兼容的服务自启与管理
+# 5. 服务清理与启动
 # -------------------------------------------------------------
-echo -e "${GREEN}[*] 正在重启服务使其生效...${NC}"
+echo -e "${GREEN}[*] 正在清理残留并启动服务...${NC}"
 
-# fix: 修正冗余重定向写法
-if check_cmd systemctl && systemctl list-units &>/dev/null; then
+# 核心：必须清理残留的 sock 文件，否则重启会报错
+rm -f /var/run/fail2ban/fail2ban.sock
+
+if check_cmd systemctl; then
     systemctl daemon-reload
     systemctl enable fail2ban
     systemctl restart fail2ban
-    echo -e "${GREEN}[√] Fail2ban (systemd) 启动指令已执行！${NC}"
-elif check_cmd rc-service; then
-    rc-update add fail2ban default
-    rc-service fail2ban restart
-    echo -e "${GREEN}[√] Fail2ban (openrc) 启动指令已执行！${NC}"
-elif [[ -x /etc/init.d/fail2ban ]]; then
-    if check_cmd update-rc.d; then
-        update-rc.d fail2ban defaults
-    elif check_cmd chkconfig; then
-        chkconfig fail2ban on
-    fi
-    /etc/init.d/fail2ban restart
-    echo -e "${GREEN}[√] Fail2ban (sysvinit) 启动指令已执行！${NC}"
 else
-    echo -e "${YELLOW}警告：无法自动管理服务，请手动启动 fail2ban (如：fail2ban-server -b)。${NC}"
+    service fail2ban restart
 fi
 
-# fix: 验证服务是否真正启动成功
+# -------------------------------------------------------------
+# 6. 验证结果
+# -------------------------------------------------------------
 sleep 2
-if fail2ban-client status &>/dev/null; then
-    echo -e "${GREEN}[√] Fail2ban 服务运行正常。${NC}"
+if fail2ban-client status sshd &>/dev/null; then
+    echo -e "${GREEN}[√] Fail2ban 启动成功！${NC}"
+    fail2ban-client status sshd
 else
-    echo -e "${RED}[!] 警告：fail2ban 可能未正常运行，请检查日志：journalctl -xe -u fail2ban${NC}"
+    echo -e "${RED}[!] 启动失败，可能的原因：${NC}"
+    echo "1. 请检查防火墙组件 ($BANACTION) 是否安装"
+    echo "2. 执行 fail2ban-server -f -v start 查看前台报错"
 fi
 
 echo -e "\n${CYAN}=================================================${NC}"
-echo -e "${GREEN}安装与配置已全部完成！${NC}"
-echo -e "使用 ${YELLOW}fail2ban-client status sshd${NC} 即可查看拦截战况。"
+echo -e "${GREEN}配置完成！已根据你的环境自动适配日志后端：$BACKEND${NC}"
 echo -e "${CYAN}=================================================${NC}\n"
